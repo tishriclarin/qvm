@@ -1,0 +1,665 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -euo pipefail
+umask 077
+die() { printf '%s\n' "$*" >&2; exit 1; }
+usage() {
+  cat <<'HELP'
+qvm help                    Show commands and console keys
+qvm                         Start enabled autostart VMs in the background
+qvm boot [VM] [serial|vnc|x11] [bg|fg]
+qvm fg [VM]                 Attach to a running VM's serial console
+qvm stop VM                 Request a clean guest shutdown
+qvm restart VM              Shut down cleanly and boot again
+qvm install ISO [serial|vnc|x11]
+qvm import NAME             Copy the original single-VM installation
+qvm clone SOURCE [NAME]
+qvm template VM
+qvm remove VM [--yes]
+qvm list
+qvm widget [VM] [serial|vnc|x11] [bg|fg]
+                             Serial widgets default to opening the console
+qvm widget-menu VM           Create Stop and Restart launcher actions
+qvm widget-refresh           Refresh VM status labels
+qvm diagnose | repair
+Serial console
+  Enter                     Show the Debian prompt if the console is blank
+  Ctrl + ]                  Detach and leave Debian running
+  qvm fg [VM]               Reattach from the Termux prompt
+
+Edit ~/qvm/qvm.conf for default VM, enablement and autostart.
+HELP
+}
+case "${1:-}" in -h|--help|help) usage; exit;; esac
+[[ -n ${PREFIX:-} && $(uname -m) == aarch64 ]] || die 'Run in ARM64 Termux.'
+qemu=$PREFIX/bin/qemu-system-aarch64
+img=$PREFIX/bin/qemu-img
+dng=/system/lib64/libdng_sdk.so
+symbol=JxlResizableParallelRunner
+qemu_env=(env -u LD_PRELOAD -u LD_LIBRARY_PATH)
+shopt -s nullglob
+jxl_files=("$PREFIX"/lib/libjxl_threads.so "$PREFIX"/lib/libjxl_threads.so.*)
+preload=
+probe_error=
+
+defined_symbol() {
+  [[ -f $1 ]] && readelf --dyn-syms --wide "$1" 2>/dev/null |
+    awk -v sym="$symbol" '
+      $7 != "UND" && $5 ~ /^(GLOBAL|WEAK)$/ && $6 == "DEFAULT" &&
+        ($8 == sym || index($8, sym "@@") == 1) { found=1 }
+      END { exit !found }'
+}
+
+probe() {
+  [[ -x $qemu ]] || die 'Install qemu-system-aarch64 (or its headless variant) and qemu-utils in Termux.'
+  if probe_error=$("${qemu_env[@]}" "$qemu" --version 2>&1); then
+    printf '%s\n' "$probe_error"
+    return
+  fi
+  printf 'Baseline QEMU failed:\n%s\n' "$probe_error" >&2
+  [[ $probe_error == *"$symbol"* && $probe_error == *libdng_sdk.so* ]] || return 1
+  command -v readelf >/dev/null || return 1
+  local lib result
+  for lib in "${jxl_files[@]}"; do
+    if defined_symbol "$lib"; then
+      if result=$("${qemu_env[@]}" "LD_PRELOAD=$lib" "$qemu" --version 2>&1); then
+        preload=$lib
+        printf 'QEMU-only preload: %s\n%s\n' "$preload" "$result"
+        return 0
+      fi
+      printf 'Preload trial with %s failed:\n%s\n' "$lib" "$result" >&2
+    fi
+  done
+  return 1
+}
+
+run_qemu() {
+  local env_args=("${qemu_env[@]}")
+  if [[ -n $preload ]]; then env_args+=("LD_PRELOAD=$preload"); fi
+  "${env_args[@]}" "$qemu" "$@"
+}
+
+diagnose() {
+  dpkg-query -W -f='${Package} ${Version}\n' 'qemu*' libjxl binutils 2>/dev/null || true
+  if command -v readelf >/dev/null; then
+    local elf
+    for elf in "$qemu" "$dng"; do
+      [[ -r $elf ]] || continue
+      printf '\nELF dependencies for %s\n' "$elf"
+      readelf -dW "$elf" | awk '/NEEDED|RUNPATH|RPATH/'
+      readelf --dyn-syms --wide "$elf" | awk -v sym="$symbol" '$8 ~ ("^" sym) {print}'
+    done
+    for elf in "${jxl_files[@]}"; do
+      if defined_symbol "$elf"; then printf 'Exports %s: %s\n' "$symbol" "$elf"; fi
+    done
+  else
+    printf 'Install binutils for the ELF dependency and symbol report.\n'
+  fi
+  if [[ -x /system/bin/linker64 && -x $qemu ]]; then
+    printf '\nAndroid linker dependency trace\n'
+    "${qemu_env[@]}" /system/bin/linker64 --list "$qemu" 2>&1 || true
+  fi
+}
+
+
+root=$HOME/qvm
+store=$root/vm
+conf=$root/qvm.conf
+command -v flock >/dev/null || die 'Install util-linux in Termux for flock.'
+mkdir -p -- "$store"
+exec 9>"$root/.lock"
+flock 9
+if [[ ! -e $conf ]]; then
+  cat > "$conf" <<'INI'
+[default]
+vm=last-used
+
+[vms]
+# NAME=enabled,manual or NAME=enabled,autostart
+# Use disabled,manual to disable a VM.
+INI
+fi
+
+ini() {
+  awk -F= -v section="$2" -v key="$3" '
+    /^[[:space:]]*\[/ { s=$0; gsub(/[[:space:]\[\]]/, "", s); next }
+    s==section && $1 !~ /^[[:space:]]*[#;]/ {
+      k=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
+      if (k==key && NF>=2) {
+        v=substr($0,index($0,"=")+1)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); found=1
+      }
+    }
+    END { if(found) print v; else exit 1 }
+  ' "$1"
+}
+registry() {
+  local tmp
+  tmp=$(mktemp "$root/.conf.XXXXXXXX")
+  awk -F= -v old="$1" -v new="$2" -v value="$3" '
+    function insert() {if(new!="") print new "=" value}
+    /^[[:space:]]*\[/ {
+      if (active) insert()
+      header=$0; gsub(/[[:space:]\[\]]/, "", header)
+      active=(header=="vms"); if(active) seen=1
+    }
+    {
+      k=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
+      if(!(active && NF>=2 && (k==old || k==new))) print
+    }
+    END {if(!seen) print "\n[vms]"; if(active || !seen) insert()}
+  ' "$conf" > "$tmp"
+  mv -fT -- "$tmp" "$conf"
+}
+valid_name() { [[ $1 =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$ ]]; }
+require_vm() {
+  valid_name "$1" && [[ -f $store/$1/vms.conf ]] || die "Unknown VM: $1"
+}
+setting() { ini "$store/$1/vms.conf" vm "$2"; }
+state() { ini "$conf" vms "$1" || printf 'disabled,manual\n'; }
+running() {
+  local pid
+  [[ -r $store/$1/qemu.pid ]] || return 1
+  read -r pid < "$store/$1/qemu.pid" || return 1
+  [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null &&
+    tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null |
+      awk -v disk="file=$store/$1/debian13.qcow,format=qcow2" '
+        NR==1 { qemu=($0 ~ /(^|\/)qemu-system-aarch64$/) }
+        index($0,disk) && qemu { match_disk=1 }
+        END { exit !match_disk }
+      '
+}
+lock_vm() {
+  exec 8>"$store/$1/.lock"
+  flock -n 8 || die "VM is busy: $1"
+}
+idle() {
+  lock_vm "$1"
+  if running "$1"; then die "Shut down $1 first."; fi
+}
+names() {
+  local d
+  for d in "$store"/*; do
+    if [[ -f $d/vms.conf ]]; then printf '%s\n' "${d##*/}"; fi
+  done
+}
+unique_name() {
+  local candidate=$1 n=0
+  while [[ -e $store/$candidate || -L $store/$candidate ]]; do
+    ((n+=1))
+    printf -v candidate '%s-%03d' "$1" "$n"
+  done
+  valid_name "$candidate" || die 'VM name is invalid or too long.'
+  printf '%s\n' "$candidate"
+}
+allocate_port() {
+  local key=$1 port=$2 name used
+  while ((port <= $3)); do
+    used=0
+    while IFS= read -r name; do
+      if [[ $(setting "$name" "$key") == "$port" ]]; then used=1; break; fi
+    done < <(names)
+    if ((used == 0)); then printf '%s\n' "$port"; return; fi
+    ((port+=1))
+  done
+  die "No available $key."
+}
+firmware=$PREFIX/share/qemu
+code=$firmware/edk2-aarch64-code.fd
+vars_template=$firmware/edk2-aarch64-vars.fd
+[[ -r $vars_template ]] || vars_template=$firmware/edk2-arm-vars.fd
+check_firmware() {
+  local fd
+  for fd in "$@"; do
+    [[ -r $fd && $(stat -c %s -- "$fd") == 67108864 ]] ||
+      die "Missing or invalid 64 MiB UEFI firmware: $fd"
+  done
+}
+new_vm() (
+  local name=$1 source=${2:-} legacy=${3:-} stage ssh vnc
+  [[ -x $img ]] || die 'Install qemu-utils in Termux.'
+  ssh=$(allocate_port ssh_port 2222 5899)
+  vnc=$(allocate_port vnc_port 5900 5999)
+  stage=$(mktemp -d "$store/.new.XXXXXXXX")
+  trap 'rm -rf -- "$stage"' EXIT
+  if [[ -n $legacy ]]; then
+    "$img" convert -f qcow2 -O qcow2 "$legacy/debian13.qcow2" "$stage/debian13.qcow"
+    cp -- "$legacy/uefi-vars.fd" "$stage/efi-vars.fd"
+  elif [[ -n $source ]]; then
+    "$img" create -f qcow2 -F qcow2 -b "$store/$source/debian13.qcow" "$stage/debian13.qcow"
+    cp -- "$store/$source/efi-vars.fd" "$stage/efi-vars.fd"
+  else
+    check_firmware "$code" "$vars_template"
+    "$img" create -f qcow2 "$stage/debian13.qcow" 32G
+    cp -- "$vars_template" "$stage/efi-vars.fd"
+  fi
+  cat > "$stage/vms.conf" <<INI
+[vm]
+type=vm
+parent=$source
+boot=serial
+process=bg
+ssh_port=$ssh
+vnc_port=$vnc
+ram_mib=3072
+vcpus=4
+INI
+  mv -T -- "$stage" "$store/$name"
+  registry '' "$name" enabled,manual
+)
+dependents() {
+  local child
+  while IFS= read -r child; do
+    if [[ $(setting "$child" parent) == "$1" ]]; then printf '%s\n' "$child"; fi
+  done < <(names)
+}
+select_vm() {
+  local name
+  name=$(ini "$conf" default vm) || die 'Set [default] vm in qvm.conf.'
+  if [[ $name == last-used ]]; then
+    [[ -s $root/.last-used ]] || die 'No last-used VM. Run qvm boot VM first.'
+    read -r name < "$root/.last-used"
+  fi
+  require_vm "$name"
+  printf '%s\n' "$name"
+}
+refresh_widget() {
+  local name=$1 shortcuts=$HOME/.shortcuts status=STOPPED old
+  local -a entries=("$shortcuts/$name · RUNNING" "$shortcuts/$name · STOPPED")
+  if running "$name"; then status=RUNNING; fi
+  for old in "${entries[@]}"; do
+    if [[ -f $old && $old != "$shortcuts/$name · $status" ]]; then
+      mv -fT -- "$old" "$shortcuts/$name · $status" || return
+    fi
+  done
+}
+notify_widget() {
+  if command -v am >/dev/null; then
+    am broadcast -n com.termux.widget/.TermuxWidgetProvider \
+      -a com.termux.widget.ACTION_REFRESH_WIDGET --ei appWidgetId 0 >/dev/null 2>&1 || true
+  fi
+}
+console_socket() {
+  local hash
+  hash=$(printf '%s' "$1" | sha256sum)
+  printf '%s/.console-%s.sock\n' "$root" "${hash:0:24}"
+}
+power_socket() {
+  local socket
+  socket=$(console_socket "$1")
+  printf '%s.qmp\n' "${socket%.sock}"
+}
+request_powerdown() (
+  local line
+  coproc QMP { exec socat - "UNIX-CONNECT:$1" 8>&- 9>&-; }
+  local client=$QMP_PID
+  trap 'kill "$client" 2>/dev/null || true' EXIT
+  exec 6<&"${QMP[0]}" 7>&"${QMP[1]}"
+  read -r -t 5 line <&6 || die 'QEMU monitor did not respond.'
+  [[ $line == *'"QMP"'* ]] || die 'Unexpected QEMU monitor greeting.'
+  printf '%s\n' '{"execute":"qmp_capabilities"}' >&7
+  read -r -t 5 line <&6 || die 'QEMU monitor handshake timed out.'
+  [[ $line == *'"return"'* ]] || die "QEMU monitor handshake failed: $line"
+  printf '%s\n' '{"execute":"system_powerdown","id":"qvm-stop"}' >&7
+  while read -r -t 5 line <&6; do
+    [[ $line == *'"qvm-stop"'* ]] || continue
+    [[ $line == *'"return"'* ]] || die "QEMU rejected shutdown: $line"
+    exit 0
+  done
+  die 'QEMU closed the monitor or did not acknowledge shutdown.'
+)
+attach_console() (
+  local name=$1 socket=$2 owner terminal title
+  owner=$store/$name/console.owner
+  exec 7>"$store/$name/.console.lock"
+  if ! flock -n 7; then
+    if [[ -s $owner ]] && IFS= read -r title < "$owner"; then
+      printf 'Console already attached. Switch to "%s" in the Termux sidebar.\n' "$title"
+    else
+      printf 'Console already attached. Switch to the existing %s session in Termux.\n' "$name"
+    fi
+    return 0
+  fi
+  terminal=$(tty) || die 'Open the console from an interactive Termux session.'
+  title="$name console (${terminal#/dev/})"
+  printf '%s\n' "$title" > "$owner"
+  trap 'rm -f -- "$owner"' EXIT
+  printf '\033]0;%s\007' "$title"
+  printf 'Press Enter for the guest prompt. Ctrl + ] detaches and leaves Debian running.\n'
+  socat -,rawer,escape=0x1d "UNIX-CONNECT:$socket" 9>&- 8>&-
+)
+parse_boot() {
+  selected='' backend='' process=''
+  local arg
+  for arg in "$@"; do
+    case $arg in
+      serial|vnc|x11) [[ -z $backend ]] || die 'Specify one display mode.'; backend=$arg ;;
+      bg|background|fg|foreground)
+        [[ -z $process ]] || die 'Specify one process mode.'
+        case $arg in bg|background) process=bg;; *) process=fg;; esac ;;
+      *) [[ -z $selected ]] || die 'Specify one VM.'; require_vm "$arg"; selected=$arg ;;
+    esac
+  done
+}
+start_vm() {
+  local name=$1 backend=$2 process=$3 iso=${4:-}
+  local dir=$store/$name serial=none ssh vnc ram cpu help socket monitor interactive=0
+  local -a display media=() daemon=() console=()
+  require_vm "$name"
+  [[ $(setting "$name" type) == vm ]] || die "$name is a template. Clone it to boot."
+  case $(state "$name") in enabled,manual|enabled,autostart) ;; *) die "$name is disabled.";; esac
+  lock_vm "$name"
+  if [[ $backend == serial && $process == fg && -z $iso ]]; then
+    command -v socat >/dev/null || die 'Install socat with pkg install socat.'
+    interactive=1
+    process=bg
+  fi
+  socket=$(console_socket "$name")
+  monitor=$(power_socket "$name")
+  if running "$name"; then
+    if ((interactive)); then
+      [[ -S $socket ]] || die 'This VM was started without a console socket. Shut it down and restart with this launcher.'
+      exec 8>&-
+      flock -u 9
+      attach_console "$name" "$socket"
+      return
+    fi
+    printf '%s is already running.\n' "$name"; return; fi
+  rm -f -- "$dir/qemu.pid" "$socket" "$monitor"
+  check_firmware "$code" "$dir/efi-vars.fd"
+  [[ -s $dir/debian13.qcow ]] || die "Missing virtual disk for $name."
+  ssh=$(setting "$name" ssh_port)
+  vnc=$(setting "$name" vnc_port)
+  ram=$(setting "$name" ram_mib)
+  cpu=$(setting "$name" vcpus)
+  [[ $ssh =~ ^[1-9][0-9]{3,4}$ && $vnc =~ ^[1-9][0-9]{3,4}$ &&
+     $ram =~ ^[1-9][0-9]{0,5}$ && $cpu =~ ^[1-9][0-9]{0,2}$ ]] ||
+    die "Invalid port or resource setting for $name."
+  ((ssh <= 65535 && vnc >= 5900 && vnc <= 65535)) || die "Invalid port for $name."
+  [[ $dir != *,* && $firmware != *,* && $iso != *,* ]] || die 'QEMU paths cannot contain commas.'
+  probe || die 'Run qvm repair.'
+  case $process in
+    bg)
+      daemon=(-daemonize)
+      console=(-chardev "socket,id=qvmserial,path=$socket,server=on,wait=off,logfile=$dir/serial.log,logappend=on")
+      ;;
+    fg) ;;
+    *) die 'Choose bg or fg.';;
+  esac
+  case $backend in
+    serial)
+      display=(-display none)
+      serial=stdio
+      ;;
+    vnc)
+      help=$(run_qemu -help)
+      [[ $help =~ (^|[[:space:]])-vnc[[:space:]] ]] || die 'This QEMU build lacks VNC.'
+      display=(-display none -vnc "127.0.0.1:$((vnc-5900))") ;;
+    x11)
+      [[ $process == fg ]] || die 'Use fg for Termux:X11.'
+      help=$(run_qemu -display help 2>&1)
+      export DISPLAY=${DISPLAY:-:1}
+      if [[ $help =~ (^|[[:space:]])sdl([[:space:]]|$) ]]; then
+        export SDL_VIDEODRIVER=x11
+        display=(-display sdl,gl=off)
+      elif [[ $help =~ (^|[[:space:]])gtk([[:space:]]|$) ]]; then
+        export GDK_BACKEND=x11
+        display=(-display gtk,gl=off)
+      else die 'No SDL or GTK backend.'; fi ;;
+    *) die 'Choose serial, vnc or x11.';;
+  esac
+  if [[ $process == bg ]]; then serial=chardev:qvmserial; fi
+  if [[ -n $iso ]]; then
+    media=(-device virtio-scsi-pci,id=scsi
+      -drive "if=none,id=iso,file=$iso,media=cdrom,format=raw,readonly=on"
+      -device scsi-cd,bus=scsi.0,drive=iso,bootindex=0 -no-reboot)
+  fi
+  if [[ $backend == vnc ]]; then printf 'VNC: 127.0.0.1:%s\n' "$vnc"; fi
+  if [[ $process == fg ]]; then
+    printf '%s\n' "$name" > "$root/.last-used"
+    flock -u 9
+  fi
+  run_qemu "${daemon[@]}" -pidfile "$dir/qemu.pid" -L "$firmware" \
+    -machine virt,accel=tcg -cpu max -smp "$cpu" -m "$ram" \
+    -drive "if=pflash,format=raw,unit=0,file=$code,readonly=on" \
+    -drive "if=pflash,format=raw,unit=1,file=$dir/efi-vars.fd" \
+    -drive "if=none,id=os,file=$dir/debian13.qcow,format=qcow2" \
+    -device virtio-blk-pci,drive=os,bootindex=1 \
+    -device virtio-gpu-pci -device qemu-xhci -device usb-kbd -device usb-tablet \
+    -netdev "user,id=net,hostfwd=tcp:127.0.0.1:$ssh-:22" \
+    -device virtio-net-pci,netdev=net,romfile= "${media[@]}" \
+    -monitor none -qmp "unix:$monitor,server=on,wait=off" "${console[@]}" -serial "$serial" "${display[@]}" 8>&- 9>&-
+  if [[ $process == bg ]]; then
+    printf '%s\n' "$name" > "$root/.last-used"
+    refresh_widget "$name"
+    notify_widget
+    printf '%s started. SSH: 127.0.0.1:%s\n' "$name" "$ssh"
+    if ((interactive)); then
+      exec 8>&-
+      flock -u 9
+      attach_console "$name" "$socket"
+    fi
+  else
+    refresh_widget "$name"
+    notify_widget
+  fi
+}
+mode=${1:-autostart}
+if (($#)); then shift; fi
+case $mode in
+  autostart)
+    [[ $# == 0 ]] || die 'Usage: qvm'
+    result=0
+    flock -u 9
+    while IFS= read -r name; do
+      [[ $(state "$name") == enabled,autostart ]] || continue
+      "$PREFIX/bin/bash" "${BASH_SOURCE[0]}" boot "$name" bg 9>&- || result=1
+    done < <(names)
+    exit "$result"
+    ;;
+  fg)
+    [[ $# -le 1 ]] || die 'Usage: qvm fg [VM]'
+    command -v socat >/dev/null || die 'Install socat with pkg install socat.'
+    name=${1:-$(select_vm)}
+    require_vm "$name"
+    running "$name" || die "$name is stopped. Use qvm boot $name serial fg."
+    socket=$(console_socket "$name")
+    [[ -S $socket ]] || die 'This VM was started without a console socket. Shut it down and restart with this launcher.'
+    flock -u 9
+    attach_console "$name" "$socket"
+    ;;
+  restart)
+    [[ $# == 1 ]] || die 'Usage: qvm restart VM'
+    require_vm "$1"
+    launcher=$(realpath -- "${BASH_SOURCE[0]}")
+    flock -u 9
+    "$PREFIX/bin/bash" "$launcher" stop "$1" 9>&-
+    exec "$PREFIX/bin/bash" "$launcher" boot "$1" 9>&-
+    ;;
+  widget-menu)
+    [[ $# == 1 ]] || die 'Usage: qvm widget-menu VM'
+    require_vm "$1"
+    [[ $(setting "$1" type) == vm ]] || die 'Select a bootable VM.'
+    launcher=$(realpath -- "${BASH_SOURCE[0]}")
+    directory=$HOME/.termux/widget/dynamic_shortcuts
+    mkdir -p -- "$directory"
+    for action in stop restart; do
+      shortcut=$(mktemp "$directory/.qvm.XXXXXXXX")
+      trap 'rm -f -- "$shortcut"' EXIT
+      printf '#!%s/bin/bash\nexec %q %q %q %q\n' \
+        "$PREFIX" "$PREFIX/bin/bash" "$launcher" "$action" "$1" > "$shortcut"
+      chmod 700 -- "$shortcut"
+      mv -fT -- "$shortcut" "$directory/${action^} $1"
+    done
+    printf 'Publish the actions with Create Shortcuts in Termux:Widget.\n'
+    ;;
+  stop)
+    [[ $# == 1 ]] || die 'Usage: qvm stop VM'
+    name=$1
+    require_vm "$name"
+    if ! running "$name"; then printf '%s is already stopped.\n' "$name"; exit; fi
+    monitor=$(power_socket "$name")
+    [[ -S $monitor ]] || die 'This VM was started before qvm stop was available. Run sudo poweroff inside Debian.'
+    command -v socat >/dev/null || die 'Install socat with pkg install socat.'
+    printf 'Requesting a clean shutdown of %s...\n' "$name"
+    if ! request_powerdown "$monitor" && running "$name"; then exit 1; fi
+    deadline=$((SECONDS + 60))
+    while running "$name"; do
+      ((SECONDS < deadline)) || die 'Debian is still running. Sign in and run sudo poweroff.'
+      sleep 1
+    done
+    refresh_widget "$name"
+    notify_widget
+    printf '%s stopped.\n' "$name"
+    ;;
+  widget-refresh)
+    [[ $# == 0 ]] || die 'Usage: qvm widget-refresh'
+    while IFS= read -r name; do refresh_widget "$name"; done < <(names)
+    notify_widget
+    ;;
+  boot|widget)
+    parse_boot "$@"
+    name=${selected:-$(select_vm)}
+    backend=${backend:-$(setting "$name" boot)}
+    if [[ $mode == widget && $backend == serial && -z $process ]]; then
+      process=fg
+    fi
+    process=${process:-$(setting "$name" process)}
+    if [[ $mode == boot ]]; then
+      start_vm "$name" "$backend" "$process"
+    else
+      [[ $(setting "$name" type) == vm ]] || die 'Select a bootable VM.'
+      launcher=$(realpath -- "${BASH_SOURCE[0]}")
+      shortcuts=$HOME/.shortcuts
+      mkdir -p -- "$shortcuts"
+      chmod 700 -- "$shortcuts"
+      shortcut=$(mktemp "$shortcuts/.qvm.XXXXXXXX")
+      trap 'rm -f -- "$shortcut"' EXIT
+      printf '#!%s/bin/bash\nexec %q %q boot %q %q %q\n' \
+        "$PREFIX" "$PREFIX/bin/bash" "$launcher" "$name" "$backend" "$process" > "$shortcut"
+      chmod 700 -- "$shortcut"
+      status=STOPPED
+      previous=RUNNING
+      if running "$name"; then status=RUNNING; previous=STOPPED; fi
+      mv -fT -- "$shortcut" "$shortcuts/$name · $status"
+      rm -f -- "$shortcuts/Boot $name" "$shortcuts/$name · $previous"
+      notify_widget
+      printf 'Add or refresh the Termux widget, then tap %s · %s.\n' "$name" "$status"
+    fi
+    ;;
+  install)
+    [[ $# == 1 || $# == 2 ]] || die 'Usage: qvm install ISO [serial|vnc|x11]'
+    iso=$(realpath -- "$1")
+    [[ -f $iso && -r $iso && -s $iso ]] || die 'Provide a readable ARM64 ISO.'
+    backend=${2:-vnc}
+    case $backend in serial|vnc|x11) ;; *) die 'Choose serial, vnc or x11.';; esac
+    base=${iso##*/}
+    base=${base%.[iI][sS][oO]}
+    base=${base//[^a-zA-Z0-9._-]/-}
+    valid_name "$base" || die 'Rename the ISO with a short alphanumeric basename.'
+    name=$(unique_name "$base")
+    new_vm "$name"
+    printf 'Installing into %s\n' "$name"
+    start_vm "$name" "$backend" fg "$iso"
+    ;;
+  import)
+    [[ $# == 1 ]] || die 'Usage: qvm import NAME'
+    valid_name "$1" || die 'Invalid VM name.'
+    [[ ! -e $store/$1 && ! -L $store/$1 ]] || die 'VM name already exists.'
+    legacy=$HOME/qemu-debian13-arm64
+    [[ -x $img && -s $legacy/debian13.qcow2 ]] || die 'Legacy disk or qemu-img missing.'
+    check_firmware "$legacy/uefi-vars.fd"
+    new_vm "$1" '' "$legacy"
+    printf '%s\n' "$1" > "$root/.last-used"
+    printf 'Imported %s. The original disk is still in %s.\n' "$1" "$legacy"
+    ;;
+  clone)
+    [[ $# == 1 || $# == 2 ]] || die 'Usage: qvm clone SOURCE [NAME]'
+    require_vm "$1"
+    [[ $(setting "$1" type) == template ]] || die 'Convert the source to a template first.'
+    base=${1%-template}
+    if [[ $# == 2 ]]; then
+      valid_name "$2" || die 'Invalid VM name.'
+      [[ ! -e $store/$2 && ! -L $store/$2 ]] || die 'VM name already exists.'
+      name=$2
+    else
+      name=$(unique_name "$base")
+    fi
+    new_vm "$name" "$1"
+    printf 'Created thin clone %s from %s.\n' "$name" "$1"
+    ;;
+  template)
+    [[ $# == 1 ]] || die 'Usage: qvm template VM'
+    if valid_name "$1" && [[ ! -e $store/$1 && -f $store/$1-template/vms.conf ]] &&
+       [[ $(setting "$1-template" type) == template ]]; then
+      printf '%s-template is already a template.\n' "$1"
+      exit
+    fi
+    require_vm "$1"
+    if [[ $(setting "$1" type) == template ]]; then printf '%s is already a template.\n' "$1"; exit; fi
+    idle "$1"
+    [[ -z $(dependents "$1") ]] || die 'VM is a backing image for another VM.'
+    name=$1
+    if [[ $name != *-template ]]; then
+      name=$1-template
+      valid_name "$name" || die 'Template name is too long.'
+      [[ ! -e $store/$name && ! -L $store/$name ]] || die "Already exists: $name"
+      mv -T -- "$store/$1" "$store/$name"
+    fi
+    sed -i 's/^type=vm$/type=template/' "$store/$name/vms.conf"
+    rm -f -- "$HOME/.shortcuts/$1 · RUNNING" "$HOME/.shortcuts/$1 · STOPPED" \
+      "$HOME/.termux/widget/dynamic_shortcuts/Stop $1" \
+      "$HOME/.termux/widget/dynamic_shortcuts/Restart $1"
+    notify_widget
+    registry "$1" "$name" disabled,manual
+    printf 'Created template %s.\n' "$name"
+    ;;
+  remove)
+    [[ $# == 1 || ( $# == 2 && $2 == --yes ) ]] || die 'Usage: qvm remove VM [--yes]'
+    require_vm "$1"
+    idle "$1"
+    children=$(dependents "$1")
+    [[ -z $children ]] || die "Cannot remove $1. Dependent VMs: $children"
+    if [[ $# == 1 ]]; then
+      printf 'Permanently delete %s and its disk? [y/N] ' "$1"
+      read -r answer || exit 1
+      [[ $answer == y || $answer == Y ]] || exit 0
+    fi
+    rm -rf -- "$store/$1"
+    rm -f -- "$HOME/.shortcuts/$1 · RUNNING" "$HOME/.shortcuts/$1 · STOPPED" \
+      "$HOME/.termux/widget/dynamic_shortcuts/Stop $1" \
+      "$HOME/.termux/widget/dynamic_shortcuts/Restart $1"
+    notify_widget
+    registry "$1" '' ''
+    if [[ -f $root/.last-used && $(<"$root/.last-used") == "$1" ]]; then rm -f -- "$root/.last-used"; fi
+    printf 'Removed %s.\n' "$1"
+    ;;
+  list)
+    [[ $# == 0 ]] || die 'Usage: qvm list'
+    printf '%-24s %-10s %-11s %-10s %-8s %-8s %s\n' VM ENABLED STARTUP BOOT MODE STATUS SSH
+    while IFS= read -r name; do
+      policy=$(state "$name")
+      status=stopped
+      ssh=$(setting "$name" ssh_port)
+      if [[ $(setting "$name" type) == template ]]; then
+        status=template
+        ssh=-
+      elif running "$name"; then
+        status=running
+      fi
+      printf '%-24s %-10s %-11s %-10s %-8s %-8s %s\n' "$name" "${policy%,*}" "${policy#*,}" \
+        "$(setting "$name" boot)" "$(setting "$name" process)" "$status" "$ssh"
+    done < <(names)
+    ;;
+  diagnose|repair)
+    [[ $# == 0 ]] || die 'Usage: qvm diagnose | repair'
+    if [[ $mode == diagnose ]]; then
+      diagnose
+    elif ! command -v readelf >/dev/null || [[ ! -e $PREFIX/lib/libjxl_threads.so && ${#jxl_files[@]} == 1 ]]; then
+      apt-get install --no-remove binutils libjxl
+      jxl_files=("$PREFIX"/lib/libjxl_threads.so "$PREFIX"/lib/libjxl_threads.so.*)
+    fi
+    probe || die 'QEMU startup probe failed.'
+    run_qemu -display help
+    ;;
+  *) usage; exit 2;;
+esac
