@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/qvm.png" width="144" alt="QVM project icon"></p>
+<p align="center"><img src="assets/banner.webp" alt="QVM — Virtual machines on ARM64 Android"></p>
 
 # QVM
 
