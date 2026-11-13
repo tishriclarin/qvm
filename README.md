@@ -8,6 +8,27 @@ Many Android phones restrict running another operating system directly on the de
 
 Boot a VM in the background, reconnect to its console when you need it, and use templates and thin clones to set up new environments.
 
+## Why carry a VM in your pocket?
+
+Carry your Linux tools, projects, and test environments on your ARM64 Android phone. QVM runs Debian through Termux without rooting Android.
+
+| Use case | What you can do |
+| --- | --- |
+| **AI-assisted development** | Give a connected coding assistant a Debian workspace to edit code, build projects, and run tests. For workloads your phone can handle, the VM can replace a rented cloud development machine. |
+| **AI-assisted network diagnostics** | Use authorized SSH jump hosts or tunnels to reach managed devices. A connected assistant can help interpret routing tables, interface counters, DNS results, and service logs. |
+| **Voice-based incident briefings** | Ask for a spoken summary of an incident or diagnostic results. If you’re driving, pull over before starting diagnostics, reviewing output, entering credentials, or approving changes. |
+| **ISP field support** | Carry tools for MikroTik, Juniper, Cisco, and ZTE. Check BGP or OSPF state, query SNMP, and collect OLT or ONU diagnostics. |
+| **Backup workstation** | Reach a jump host, inspect a service, retrieve a configuration backup, or recover a deployment when your laptop is unavailable. Use a keyboard or Samsung DeX for a larger workspace. |
+| **ARM64 builds and compatibility testing** | Build and test Rust, Go, Python, or C projects in Debian ARM64 before deploying to an ARM64 server. |
+| **Local service development** | Run a test API, database, or dashboard. Use a small dataset to test a billing API change or an SNMP collector before deploying it. |
+| **Reproducible test environments** | Keep a clean Debian template and create thin clones for upgrades, package experiments, or client-specific toolsets. |
+| **Offline work** | Edit code, read cached documentation, run tests with installed dependencies, and analyze saved logs or packet captures. |
+| **Automation and scheduled checks** | Run short backup, reporting, or monitoring jobs while the VM is running. Continuous jobs depend on Android keeping Termux and QEMU alive. |
+| **Training and demos** | Carry a repeatable lab for shell scripting, routing, DNS, web services, or databases. Start a fresh clone for each exercise. |
+| **Separate client environments** | Keep project files, configuration, and tool versions in separate guests for different clients or jobs. |
+
+**Connecting an AI assistant.** QVM provides the local execution environment. A hosted assistant such as ChatGPT Work needs a separate authorized integration to reach it. QVM’s default SSH forward binds to the phone’s localhost, where Termux can access it.
+
 ## Get Termux
 
 [<img src="https://raw.githubusercontent.com/termux/termux.github.io/master/favicon.ico" width="40" alt="Termux icon">](https://play.google.com/store/apps/details?id=com.termux)
