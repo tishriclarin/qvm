@@ -4,7 +4,9 @@
 
 **Put your phone’s spare CPU cores to work.** QVM lets you carry a local Linux virtual machine on your ARM64 Android phone, ready whenever you need your tools on the go.
 
-Many Android phones restrict running another operating system directly on the device. QVM runs Debian inside a QEMU virtual machine through Termux, with no root access required on Android. Use the guest for Linux tools, development, or network troubleshooting, and keep your VM files on the phone.
+Android can limit the tools you can run and how you run another operating system. QVM runs Debian inside a QEMU virtual machine through Termux, with no root access required on Android. Your VM files stay on your phone.
+
+**A VM in your pocket.** Build and test an ARM64 project between meetings, or SSH through an authorized jump host to check a router when your laptop is out of reach. A connected AI assistant can help run tests or interpret diagnostic output.
 
 Boot a VM in the background, reconnect to its console when you need it, and use templates and thin clones to set up new environments.
 
