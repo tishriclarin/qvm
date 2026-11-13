@@ -6,7 +6,7 @@
 
 Android can limit the tools you can run and how you run another operating system. QVM runs Debian inside a QEMU virtual machine through Termux, with no root access required on Android. Your VM files stay on your phone.
 
-**A VM in your pocket.** Vibe-code on the move with chat and a local Linux sandbox. Describe a feature or fix from your phone, and a connected AI coding assistant can edit code, build your ARM64 project, and run tests inside the VM. For network troubleshooting, SSH through an authorized jump host to check a router and ask the assistant to interpret the results. A full-size keyboard is optional.
+**A VM in your pocket.** Vibe-code on the move with chat and a local Linux sandbox. Describe a feature or fix from your phone, and a connected AI coding assistant can edit code, build your ARM64 project, and run tests inside the VM. Run your code in the sandbox or start a development server to preview the site you’re building on your phone. For network troubleshooting, SSH through an authorized jump host to check a router and ask the assistant to interpret the results. A full-size keyboard is optional.
 
 Boot a VM in the background, reconnect to its console when you need it, and use templates and thin clones to set up new environments.
 
