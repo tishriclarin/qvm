@@ -2,7 +2,11 @@
 
 # QVM
 
-QVM is a command-line virtual machine manager for people who need a QEMU VM on the go. It runs in Termux on ARM64 Android. Use it to install Debian from an ISO, boot a guest in the background, open its serial console, and manage templates and thin clones.
+**Put your phone’s spare CPU cores to work.** QVM lets you carry a local Linux virtual machine on your ARM64 Android phone, ready whenever you need your tools on the go.
+
+Many Android phones restrict running another operating system directly on the device. QVM runs Debian inside a QEMU virtual machine through Termux, with no root access required on Android. Use the guest for Linux tools, development, or network troubleshooting, and keep your VM files on the phone.
+
+Boot a VM in the background, reconnect to its console when you need it, and use templates and thin clones to set up new environments.
 
 ## Get Termux
 
